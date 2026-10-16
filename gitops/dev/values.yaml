@@ -2,7 +2,7 @@ replicaCount: 2
 
 image:
   repository: pavandevopsacr12345.azurecr.io/aks-devops-app
-  tag: "7"
+  tag: "8"
   pullPolicy: IfNotPresent
 
 autoscaling:
