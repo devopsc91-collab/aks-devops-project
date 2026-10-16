@@ -1,0 +1,17 @@
+replicaCount: 2
+
+image:
+  repository: pavandevopsacr12345.azurecr.io/aks-devops-app
+  tag: "7"
+  pullPolicy: IfNotPresent
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 50
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
