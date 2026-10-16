@@ -1,6 +1,7 @@
----
+
 trigger:
   - main
+
 variables:
   dockerRegistryServiceConnection: acr-connection-fixed
   azureSubscription: azure-subscription-fixed
@@ -10,17 +11,22 @@ variables:
   tag: $(Build.BuildId)
   aksResourceGroup: aks-devops-rg2
   aksClusterName: pavan-aks-cluster
+
 stages:
+
+  # Stage 1: Build and push the Docker image
   - stage: Build
     displayName: Build and Push Image
     jobs:
       - job: BuildImage
+        displayName: Build Docker Image
         pool:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
+
           - task: Docker@2
-            displayName: Build and Push Docker Image
+            displayName: Build and Push to ACR
             inputs:
               command: buildAndPush
               repository: $(imageRepository)
@@ -28,50 +34,57 @@ stages:
               containerRegistry: $(dockerRegistryServiceConnection)
               tags: |
                 $(tag)
+
+  # Stage 2: Scan the image with Trivy
   - stage: SecurityScan
     displayName: Trivy Security Scan
     dependsOn: Build
     jobs:
       - job: ScanImage
+        displayName: Scan Container Image
         pool:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
+
           - task: Docker@2
             displayName: Login to ACR
             inputs:
               command: login
               containerRegistry: $(dockerRegistryServiceConnection)
-          - script: >
-              sudo apt-get update
 
-              sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-
-
-              wget https://aquasecurity.github.io/trivy-repo/deb/public.key
-
-              sudo apt-key add public.key
-
-
-              echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
-
+          - script: |
+              set -euo pipefail
 
               sudo apt-get update
+              sudo apt-get install -y wget gnupg
 
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+                | gpg --dearmor \
+                | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+
+              echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+                | sudo tee /etc/apt/sources.list.d/trivy.list
+
+              sudo apt-get update
               sudo apt-get install -y trivy
-
 
               docker pull $(containerRegistry)/$(imageRepository):$(tag)
 
+              trivy image \
+                --exit-code 1 \
+                --severity HIGH,CRITICAL \
+                $(containerRegistry)/$(imageRepository):$(tag)
+            displayName: Scan Docker Image with Trivy
 
-              trivy image $(containerRegistry)/$(imageRepository):$(tag)
-            displayName: Scan Docker Image
+  # Stage 3: Deploy to DEV
   - stage: DeployDev
     displayName: Deploy to DEV
     dependsOn: SecurityScan
+    condition: succeeded()
     jobs:
       - deployment: DeployDev
-        displayName: Deploy to DEV
+        displayName: Deploy Application to DEV
         environment: dev
         pool:
           vmImage: ubuntu-latest
@@ -80,36 +93,50 @@ stages:
             deploy:
               steps:
                 - checkout: self
+
                 - task: HelmInstaller@1
                   displayName: Install Helm
                   inputs:
                     helmVersionToInstall: latest
+
                 - task: AzureCLI@2
-                  displayName: Login to AKS
+                  displayName: Authenticate to AKS
                   inputs:
                     azureSubscription: $(azureSubscription)
                     scriptType: bash
                     scriptLocation: inlineScript
                     inlineScript: |
+                      set -euo pipefail
+
                       az aks get-credentials \
-                        --resource-group $(aksResourceGroup) \
-                        --name $(aksClusterName) \
+                        --resource-group "$(aksResourceGroup)" \
+                        --name "$(aksClusterName)" \
                         --overwrite-existing
-                - script: >
-                    ls -la
+
+                      kubectl config current-context
+
+                - script: |
+                    set -euo pipefail
+
+                    helm lint ./helm-chart
 
                     helm upgrade --install aks-devops-app ./helm-chart \
                       --namespace dev \
                       --create-namespace \
                       --set image.repository=$(containerRegistry)/$(imageRepository) \
-                      --set image.tag=$(tag)
-                  displayName: Deploy Helm Chart
+                      --set image.tag=$(tag) \
+                      --wait \
+                      --timeout 5m
+                  displayName: Deploy Helm Chart to DEV
+
+  # Stage 4: Deploy to PROD after DEV succeeds
   - stage: DeployProd
     displayName: Deploy to PROD
     dependsOn: DeployDev
+    condition: succeeded()
     jobs:
       - deployment: DeployProd
-        displayName: Deploy to PROD
+        displayName: Deploy Application to PROD
         environment: prod
         pool:
           vmImage: ubuntu-latest
@@ -118,25 +145,38 @@ stages:
             deploy:
               steps:
                 - checkout: self
+
                 - task: HelmInstaller@1
                   displayName: Install Helm
                   inputs:
                     helmVersionToInstall: latest
+
                 - task: AzureCLI@2
-                  displayName: Login to AKS
+                  displayName: Authenticate to AKS
                   inputs:
                     azureSubscription: $(azureSubscription)
                     scriptType: bash
                     scriptLocation: inlineScript
                     inlineScript: |
+                      set -euo pipefail
+
                       az aks get-credentials \
-                        --resource-group $(aksResourceGroup) \
-                        --name $(aksClusterName) \
+                        --resource-group "$(aksResourceGroup)" \
+                        --name "$(aksClusterName)" \
                         --overwrite-existing
-                - script: >
+
+                      kubectl config current-context
+
+                - script: |
+                    set -euo pipefail
+
+                    helm lint ./helm-chart
+
                     helm upgrade --install aks-devops-app ./helm-chart \
                       --namespace prod \
                       --create-namespace \
                       --set image.repository=$(containerRegistry)/$(imageRepository) \
-                      --set image.tag=$(tag)
-                  displayName: Deploy Helm Chart
+                      --set image.tag=$(tag) \
+                      --wait \
+                      --timeout 5m
+                  displayName: Deploy Helm Chart to PROD
