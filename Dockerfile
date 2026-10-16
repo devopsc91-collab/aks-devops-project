@@ -1,24 +1,34 @@
 
-FROM node:24-trixie-slim
+# Stage 1: Install production dependencies
+FROM node:24-trixie-slim AS build
 
 WORKDIR /app
 
-ENV NODE_ENV=production
-
-# Install the latest available OS security updates
-RUN apt-get update \
-    && apt-get upgrade -y \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install production dependencies reproducibly
 COPY package*.json ./
 RUN npm ci --omit=dev \
     && npm cache clean --force
 
 COPY app.js ./
 
-EXPOSE 3000
+# Stage 2: Minimal runtime image
+FROM node:24-trixie-slim AS runtime
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# Apply available OS security updates
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build --chown=node:node /app/package.json ./package.json
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/app.js ./app.js
 
 USER node
 
+EXPOSE 3000
+
 CMD ["node", "app.js"]
+
