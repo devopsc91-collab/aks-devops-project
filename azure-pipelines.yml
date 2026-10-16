@@ -3,23 +3,38 @@ trigger:
   - main
 
 variables:
-  dockerRegistryServiceConnection: acr-connection-fixed
-  azureSubscription: azure-subscription-fixed
-  imageRepository: aks-devops-app
-  containerRegistry: pavandevopsacr12345.azurecr.io
-  dockerfilePath: Dockerfile
-  tag: $(Build.BuildId)
-  aksResourceGroup: aks-devops-rg2
-  aksClusterName: pavan-aks-cluster
+  - group: gitops-secrets
+
+  - name: dockerRegistryServiceConnection
+    value: acr-connection-fixed
+
+  - name: azureSubscription
+    value: azure-subscription-fixed
+
+  - name: imageRepository
+    value: aks-devops-app
+
+  - name: containerRegistry
+    value: pavandevopsacr12345.azurecr.io
+
+  - name: dockerfilePath
+    value: Dockerfile
+
+  - name: tag
+    value: $(Build.BuildId)
+
+  - name: aksResourceGroup
+    value: aks-devops-rg2
+
+  - name: aksClusterName
+    value: pavan-aks-cluster
 
 stages:
-
-  # Stage 1: Build and push the Docker image
+  # 1. Build and push image to ACR
   - stage: Build
     displayName: Build and Push Image
     jobs:
       - job: BuildImage
-        displayName: Build Docker Image
         pool:
           vmImage: ubuntu-latest
         steps:
@@ -35,13 +50,12 @@ stages:
               tags: |
                 $(tag)
 
-  # Stage 2: Scan the image with Trivy
+  # 2. Scan image before deployment
   - stage: SecurityScan
     displayName: Trivy Security Scan
     dependsOn: Build
     jobs:
       - job: ScanImage
-        displayName: Scan Container Image
         pool:
           vmImage: ubuntu-latest
         steps:
@@ -53,7 +67,7 @@ stages:
               command: login
               containerRegistry: $(dockerRegistryServiceConnection)
 
-          - script: |
+          - bash: |
               set -euo pipefail
 
               sudo apt-get update
@@ -69,114 +83,248 @@ stages:
               sudo apt-get update
               sudo apt-get install -y trivy
 
-              docker pull $(containerRegistry)/$(imageRepository):$(tag)
+              IMAGE="$(containerRegistry)/$(imageRepository):$(tag)"
+              docker pull "$IMAGE"
 
               trivy image \
                 --exit-code 1 \
                 --severity HIGH,CRITICAL \
-                $(containerRegistry)/$(imageRepository):$(tag)
-            displayName: Scan Docker Image with Trivy
+                "$IMAGE"
+            displayName: Scan Image with Trivy
 
-  # Stage 3: Deploy to DEV
-  - stage: DeployDev
-    displayName: Deploy to DEV
+  # 3. Update DEV GitOps values in GitHub
+  - stage: UpdateGitOpsDev
+    displayName: Update DEV GitOps Image
     dependsOn: SecurityScan
-    condition: succeeded()
     jobs:
-      - deployment: DeployDev
-        displayName: Deploy Application to DEV
-        environment: dev
+      - job: CommitDevImage
         pool:
           vmImage: ubuntu-latest
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
+        steps:
+          - checkout: self
 
-                - task: HelmInstaller@1
-                  displayName: Install Helm
-                  inputs:
-                    helmVersionToInstall: latest
+          - bash: |
+              set -euo pipefail
 
-                - task: AzureCLI@2
-                  displayName: Authenticate to AKS
-                  inputs:
-                    azureSubscription: $(azureSubscription)
-                    scriptType: bash
-                    scriptLocation: inlineScript
-                    inlineScript: |
-                      set -euo pipefail
+              git config user.name "Azure Pipelines"
+              git config user.email "azure-pipelines@users.noreply.github.com"
 
-                      az aks get-credentials \
-                        --resource-group "$(aksResourceGroup)" \
-                        --name "$(aksClusterName)" \
-                        --overwrite-existing
+              git fetch origin main
+              git checkout -B main origin/main
 
-                      kubectl config current-context
+              sed -i -E \
+                's/^  tag: .*/  tag: "$(tag)"/' \
+                gitops/dev/values.yaml
 
-                - script: |
-                    set -euo pipefail
+              git add gitops/dev/values.yaml
 
-                    helm lint ./helm-chart
+              if git diff --cached --quiet; then
+                echo "DEV image tag is already current."
+                exit 0
+              fi
 
-                    helm upgrade --install aks-devops-app ./helm-chart \
-                      --namespace dev \
-                      --create-namespace \
-                      --set image.repository=$(containerRegistry)/$(imageRepository) \
-                      --set image.tag=$(tag) \
-                      --wait \
-                      --timeout 5m
-                  displayName: Deploy Helm Chart to DEV
+              git commit -m "chore(gitops): deploy $(tag) to dev [skip ci]"
 
-  # Stage 4: Deploy to PROD after DEV succeeds
-  - stage: DeployProd
-    displayName: Deploy to PROD
-    dependsOn: DeployDev
+              AUTH="$(printf 'x-access-token:%s' "$GH_PAT" | base64 -w0)"
+
+              git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${AUTH}" \
+                push origin HEAD:main
+            displayName: Commit DEV Image Tag
+            env:
+              GH_PAT: $(GH_PAT)
+
+  # 4. Enable DEV auto-sync and verify deployment
+  - stage: ValidateDev
+    displayName: Sync and Validate DEV
+    dependsOn: UpdateGitOpsDev
+    jobs:
+      - job: WaitForDev
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: Wait for Argo CD DEV Deployment
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az aks get-credentials \
+                  --resource-group "$(aksResourceGroup)" \
+                  --name "$(aksClusterName)" \
+                  --overwrite-existing
+
+                kubectl patch application aks-devops-app-dev \
+                  -n argocd \
+                  --type merge \
+                  -p '{"spec":{"syncPolicy":{"automated":{"prune":false,"selfHeal":true},"syncOptions":["CreateNamespace=true"]}}}'
+
+                EXPECTED="$(containerRegistry)/$(imageRepository):$(tag)"
+                DEPLOYMENT="aks-devops-app-helm-chart"
+
+                echo "Waiting for DEV image: $EXPECTED"
+
+                for i in $(seq 1 36); do
+                  ACTUAL="$(kubectl get deployment "$DEPLOYMENT" -n dev \
+                    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+
+                  if [ "$ACTUAL" = "$EXPECTED" ]; then
+                    break
+                  fi
+
+                  echo "Current image: ${ACTUAL:-not available}; waiting..."
+                  sleep 10
+                done
+
+                ACTUAL="$(kubectl get deployment "$DEPLOYMENT" -n dev \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+                if [ "$ACTUAL" != "$EXPECTED" ]; then
+                  echo "ERROR: DEV did not update to the expected image."
+                  exit 1
+                fi
+
+                kubectl rollout status deployment/"$DEPLOYMENT" \
+                  -n dev --timeout=5m
+
+                for i in $(seq 1 36); do
+                  SYNC="$(kubectl get application aks-devops-app-dev -n argocd \
+                    -o jsonpath='{.status.sync.status}')"
+                  HEALTH="$(kubectl get application aks-devops-app-dev -n argocd \
+                    -o jsonpath='{.status.health.status}')"
+
+                  if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+                    echo "DEV Argo CD status: $SYNC / $HEALTH"
+                    exit 0
+                  fi
+
+                  echo "Argo CD DEV status: $SYNC / $HEALTH; waiting..."
+                  sleep 10
+                done
+
+                echo "ERROR: DEV Argo CD did not become Synced and Healthy."
+                exit 1
+
+  # 5. Promote the SAME tested image to PROD.
+  # Configure an approval check on the Azure DevOps "prod" environment.
+  - stage: PromoteGitOpsProd
+    displayName: Promote Tested Image to PROD
+    dependsOn: ValidateDev
     condition: succeeded()
     jobs:
-      - deployment: DeployProd
-        displayName: Deploy Application to PROD
+      - deployment: PromoteImage
+        displayName: Approve and Update PROD GitOps
         environment: prod
-        pool:
-          vmImage: ubuntu-latest
         strategy:
           runOnce:
             deploy:
               steps:
                 - checkout: self
 
-                - task: HelmInstaller@1
-                  displayName: Install Helm
-                  inputs:
-                    helmVersionToInstall: latest
-
-                - task: AzureCLI@2
-                  displayName: Authenticate to AKS
-                  inputs:
-                    azureSubscription: $(azureSubscription)
-                    scriptType: bash
-                    scriptLocation: inlineScript
-                    inlineScript: |
-                      set -euo pipefail
-
-                      az aks get-credentials \
-                        --resource-group "$(aksResourceGroup)" \
-                        --name "$(aksClusterName)" \
-                        --overwrite-existing
-
-                      kubectl config current-context
-
-                - script: |
+                - bash: |
                     set -euo pipefail
 
-                    helm lint ./helm-chart
+                    git config user.name "Azure Pipelines"
+                    git config user.email "azure-pipelines@users.noreply.github.com"
 
-                    helm upgrade --install aks-devops-app ./helm-chart \
-                      --namespace prod \
-                      --create-namespace \
-                      --set image.repository=$(containerRegistry)/$(imageRepository) \
-                      --set image.tag=$(tag) \
-                      --wait \
-                      --timeout 5m
-                  displayName: Deploy Helm Chart to PROD
+                    git fetch origin main
+                    git checkout -B main origin/main
+
+                    sed -i -E \
+                      's/^  tag: .*/  tag: "$(tag)"/' \
+                      gitops/prod/values.yaml
+
+                    git add gitops/prod/values.yaml
+
+                    if git diff --cached --quiet; then
+                      echo "PROD image tag is already current."
+                      exit 0
+                    fi
+
+                    git commit -m "chore(gitops): promote $(tag) to prod [skip ci]"
+
+                    AUTH="$(printf 'x-access-token:%s' "$GH_PAT" | base64 -w0)"
+
+                    git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${AUTH}" \
+                      push origin HEAD:main
+                  displayName: Commit PROD Image Tag
+                  env:
+                    GH_PAT: $(GH_PAT)
+
+  # 6. Enable PROD auto-sync and verify deployment
+  - stage: ValidateProd
+    displayName: Sync and Validate PROD
+    dependsOn: PromoteGitOpsProd
+    condition: succeeded()
+    jobs:
+      - job: WaitForProd
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: Wait for Argo CD PROD Deployment
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az aks get-credentials \
+                  --resource-group "$(aksResourceGroup)" \
+                  --name "$(aksClusterName)" \
+                  --overwrite-existing
+
+                kubectl patch application aks-devops-app-prod \
+                  -n argocd \
+                  --type merge \
+                  -p '{"spec":{"syncPolicy":{"automated":{"prune":false,"selfHeal":true},"syncOptions":["CreateNamespace=true"]}}}'
+
+                EXPECTED="$(containerRegistry)/$(imageRepository):$(tag)"
+                DEPLOYMENT="aks-devops-app-helm-chart"
+
+                echo "Waiting for PROD image: $EXPECTED"
+
+                for i in $(seq 1 36); do
+                  ACTUAL="$(kubectl get deployment "$DEPLOYMENT" -n prod \
+                    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+
+                  if [ "$ACTUAL" = "$EXPECTED" ]; then
+                    break
+                  fi
+
+                  echo "Current image: ${ACTUAL:-not available}; waiting..."
+                  sleep 10
+                done
+
+                ACTUAL="$(kubectl get deployment "$DEPLOYMENT" -n prod \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+                if [ "$ACTUAL" != "$EXPECTED" ]; then
+                  echo "ERROR: PROD did not update to the expected image."
+                  exit 1
+                fi
+
+                kubectl rollout status deployment/"$DEPLOYMENT" \
+                  -n prod --timeout=5m
+
+                for i in $(seq 1 36); do
+                  SYNC="$(kubectl get application aks-devops-app-prod -n argocd \
+                    -o jsonpath='{.status.sync.status}')"
+                  HEALTH="$(kubectl get application aks-devops-app-prod -n argocd \
+                    -o jsonpath='{.status.health.status}')"
+
+                  if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+                    echo "PROD Argo CD status: $SYNC / $HEALTH"
+                    exit 0
+                  fi
+
+                  echo "Argo CD PROD status: $SYNC / $HEALTH; waiting..."
+                  sleep 10
+                done
+
+                echo "ERROR: PROD Argo CD did not become Synced and Healthy."
+                exit 1
+
